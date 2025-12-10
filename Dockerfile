@@ -16,9 +16,9 @@ ENV LLVM_CONFIG="llvm-config-6.0"
 ADD --keep-git-dir=true https://github.com/aflnet/aflnet.git /opt/aflnet
 WORKDIR /opt/aflnet
 
-RUN make clean all && \
+RUN AFL_NO_X86=1 make clean all && \
     cd llvm_mode && \
-    make
+    AFL_NO_X86=1 make
 
 # Set up environment variables for AFLNet
 ENV AFLNET="/opt/aflnet"

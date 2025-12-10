@@ -28,7 +28,10 @@
 
 /* Version string: */
 
-#define VERSION             "2.56b"
+#define VERSION             "2.56b+"
+
+// AFLNet+ content-aware state hashing (comment out to disable)
+#define AFLNET_PLUS_CONTENT_HASH 1
 
 /******************************************************
  *                                                    *

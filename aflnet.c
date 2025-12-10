@@ -10,18 +10,31 @@
 
 #include "alloc-inl.h"
 #include "aflnet.h"
+#include "config.h"
 
 // Mapping from original state IDs to compact IDs starting from 1
 
 static u32 message_code_counter = 0;
 khash_t(32) *message_code_map = NULL;
 
+#ifdef AFLNET_PLUS_CONTENT_HASH
+KHASH_MAP_INIT_INT64(64, u32)
+static khash_t(64) *content_hash_map = NULL;
+static u32 content_state_counter = 0;
+#endif
+
 void init_message_code_map(){
   message_code_map = kh_init(32);
+#ifdef AFLNET_PLUS_CONTENT_HASH
+  content_hash_map = kh_init(64);
+#endif
 }
 
 void destroy_message_code_map(){
   kh_destroy(32, message_code_map);
+#ifdef AFLNET_PLUS_CONTENT_HASH
+  kh_destroy(64, content_hash_map);
+#endif
 }
 
 u32 get_mapped_message_code (u32 ori_message_code){
@@ -41,6 +54,143 @@ u32 get_mapped_message_code (u32 ori_message_code){
 
   return mapped_message_code;
 }
+
+#ifdef AFLNET_PLUS_CONTENT_HASH
+
+// djb2 hash of response content
+u32 hash_response_content(unsigned char* buf, unsigned int len) {
+  u32 hash = 5381;
+  unsigned int i;
+  for (i = 0; i < len; i++) {
+    hash = ((hash << 5) + hash) + buf[i];
+  }
+  return hash;
+}
+
+// normalize response before hashing to prevent state explosion from variable data
+u32 normalize_and_hash_response(unsigned char* buf, unsigned int len, u32 response_code) {
+  unsigned char *normalized;
+  unsigned int i, j;
+  u32 hash;
+  u8 in_number_sequence = 0;
+  u8 paren_depth = 0;
+  
+  normalized = (unsigned char *)ck_alloc(len + 1);
+  j = 0;
+  
+  for (i = 0; i < len; i++) {
+    unsigned char c = buf[i];
+    
+    // track parens for PASV responses
+    if (c == '(') {
+      paren_depth++;
+      normalized[j++] = c;
+      continue;
+    }
+    if (c == ')') {
+      if (paren_depth > 0) paren_depth--;
+      if (in_number_sequence) {
+        normalized[j++] = 'X';
+        in_number_sequence = 0;
+      }
+      normalized[j++] = c;
+      continue;
+    }
+    
+    // inside parens, normalize numbers
+    if (paren_depth > 0) {
+      if (c >= '0' && c <= '9') {
+        in_number_sequence = 1;
+        continue;
+      }
+      if (c == ',' || c == '.') {
+        if (in_number_sequence) {
+          normalized[j++] = 'X';
+          in_number_sequence = 0;
+        }
+        normalized[j++] = c;
+        continue;
+      }
+    }
+    
+    // code 227 (PASV): normalize numbers outside parens too
+    if (response_code == 227) {
+      if (c >= '0' && c <= '9') {
+        if (!in_number_sequence) {
+          normalized[j++] = 'X';
+          in_number_sequence = 1;
+        }
+        continue;
+      }
+      in_number_sequence = 0;
+    }
+    
+    // code 257 (PWD): normalize quoted paths
+    if (response_code == 257 && c == '"') {
+      normalized[j++] = '"';
+      i++;
+      while (i < len && buf[i] != '"') i++;
+      normalized[j++] = 'X';
+      if (i < len) normalized[j++] = '"';
+      continue;
+    }
+    
+    normalized[j++] = c;
+  }
+  
+  normalized[j] = '\0';
+  hash = hash_response_content(normalized, j);
+  ck_free(normalized);
+  return hash;
+}
+
+// map state using both response code and content hash
+u32 get_mapped_message_code_with_hash(u32 ori_message_code, u32 content_hash) {
+  u32 mapped_message_code = 0;
+  u64 combined_key = ((u64)ori_message_code << 32) | content_hash;
+  
+  khiter_t k = kh_get(64, content_hash_map, combined_key);
+  if (k == kh_end(content_hash_map)) {
+    int ret;
+    k = kh_put(64, content_hash_map, combined_key, &ret);
+    content_state_counter++;
+    kh_value(content_hash_map, k) = content_state_counter;
+    mapped_message_code = content_state_counter;
+    
+    // also update basic code map for compatibility
+    khiter_t k2 = kh_get(32, message_code_map, ori_message_code);
+    if (k2 == kh_end(message_code_map)) {
+      k2 = kh_put(32, message_code_map, ori_message_code, &ret);
+      message_code_counter++;
+      kh_value(message_code_map, k2) = message_code_counter;
+    }
+  }
+  else {
+    mapped_message_code = kh_value(content_hash_map, k);
+  }
+  
+  return mapped_message_code;
+}
+
+#else
+
+// stubs when content hashing disabled
+u32 hash_response_content(unsigned char* buf, unsigned int len) {
+  (void)buf; (void)len;
+  return 0;
+}
+
+u32 normalize_and_hash_response(unsigned char* buf, unsigned int len, u32 response_code) {
+  (void)buf; (void)len; (void)response_code;
+  return 0;
+}
+
+u32 get_mapped_message_code_with_hash(u32 ori_message_code, u32 content_hash) {
+  (void)content_hash;
+  return get_mapped_message_code(ori_message_code);
+}
+
+#endif
 
 // Protocol-specific functions for extracting requests and responses
 
@@ -2114,6 +2264,7 @@ unsigned int* extract_response_codes_rtsp(unsigned char* buf, unsigned int buf_s
   return state_sequence;
 }
 
+// AFLNet+ uses content-aware state mapping when AFLNET_PLUS_CONTENT_HASH defined
 unsigned int* extract_response_codes_ftp(unsigned char* buf, unsigned int buf_size, unsigned int* state_count_ref)
 {
   char *mem;
@@ -2134,7 +2285,7 @@ unsigned int* extract_response_codes_ftp(unsigned char* buf, unsigned int buf_si
     memcpy(&mem[mem_count], buf + byte_count++, 1);
     if ((mem_count > 0) && (memcmp(&mem[mem_count - 1], terminator, 2) == 0) && ((mem[3]==' ') || (isdigit(buf[byte_count]) && (memcmp(&mem[0], &buf[byte_count], 3))!=0) || byte_count == buf_size)) {
     // if ((mem_count > 0) && (memcmp(&mem[mem_count - 1], terminator, 2) == 0)) {
-      //Extract the response code which is the first 3 bytes
+      // extract 3-digit response code
       char temp[4];
       memcpy(temp, mem, 4);
       temp[3] = 0x0;
@@ -2142,7 +2293,13 @@ unsigned int* extract_response_codes_ftp(unsigned char* buf, unsigned int buf_si
 
       if (message_code == 0) break;
 
+#ifdef AFLNET_PLUS_CONTENT_HASH
+      // hash response content to distinguish same code with different messages
+      u32 content_hash = normalize_and_hash_response((unsigned char *)mem, mem_count + 1, message_code);
+      message_code = get_mapped_message_code_with_hash(message_code, content_hash);
+#else
       message_code = get_mapped_message_code(message_code);
+#endif
 
       state_count++;
       state_sequence = (unsigned int *)ck_realloc(state_sequence, state_count * sizeof(unsigned int));
@@ -2151,7 +2308,6 @@ unsigned int* extract_response_codes_ftp(unsigned char* buf, unsigned int buf_si
     } else {
       mem_count++;
       if (mem_count == mem_size) {
-        //enlarge the mem buffer
         mem_size = mem_size * 2;
         mem=(char *)ck_realloc(mem, mem_size);
       }

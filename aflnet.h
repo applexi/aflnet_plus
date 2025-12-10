@@ -30,6 +30,12 @@ typedef struct {
   u32 selected_seed_index;    /* the recently selected seed index */
   void **seeds;               /* keeps all seeds reaching this state -- can be casted to struct queue_entry* */
   u32 seeds_count;            /* total number of seeds, it must be equal the size of the seeds array */
+
+  // AFLNet+ content-aware state tracking
+  u32 content_hash;           /* hash of response content */
+  u32 original_code;          /* original response code before mapping */
+  u8 response_varies;         /* seen different content for same code? */
+  u32 unique_responses;       /* unique response contents for this code */
 } state_info_t;
 
 enum {
@@ -162,5 +168,10 @@ u32 read_bytes_to_uint32(unsigned char* buf, unsigned int offset, int num_bytes)
 /* Mapping from original message code IDs to compact IDs starting from 1 */
 void init_message_code_map();
 void destroy_message_code_map();
+
+// AFLNet+ content hashing functions
+u32 hash_response_content(unsigned char* buf, unsigned int len);
+u32 get_mapped_message_code_with_hash(u32 ori_message_code, u32 content_hash);
+u32 normalize_and_hash_response(unsigned char* buf, unsigned int len, u32 response_code);
 
 #endif /* __AFLNET_H */
